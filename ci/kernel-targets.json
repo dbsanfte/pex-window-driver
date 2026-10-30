@@ -1,0 +1,50 @@
+{
+  "pinned": {
+    "release": "6.14.0-37-generic",
+    "compiler": "gcc-13",
+    "container": "ubuntu:24.04",
+    "upstream": "Ubuntu 24.04 HWE 6.14.0-37.37~24.04.1",
+    "headers": [
+      {
+        "url": "https://archive.ubuntu.com/ubuntu/pool/main/l/linux-hwe-6.14/linux-headers-6.14.0-37-generic_6.14.0-37.37~24.04.1_amd64.deb",
+        "sha256": "133dc51d6d224467bd78730a7210bea2887121761d81e6fa626e55953dbb3b9b"
+      },
+      {
+        "url": "https://archive.ubuntu.com/ubuntu/pool/main/l/linux-hwe-6.14/linux-hwe-6.14-headers-6.14.0-37_6.14.0-37.37~24.04.1_all.deb",
+        "sha256": "be98c107d11a33306c71958239af5b9c399def15cf2e9262ea96f99e3b83806b"
+      }
+    ]
+  },
+  "mainline6": {
+    "release": "6.19.14-061914-generic",
+    "compiler": "gcc-15",
+    "container": "ubuntu:26.04",
+    "upstream": "Linux 6.19.14, Ubuntu Mainline build",
+    "headers": [
+      {
+        "url": "https://kernel.ubuntu.com/mainline/v6.19.14/amd64/linux-headers-6.19.14-061914-generic_6.19.14-061914.202604221411_amd64.deb",
+        "sha256": "b09043c1d69983b8531a891711f59e09264793213722a5f89f9c1b8be1c3d9bb"
+      },
+      {
+        "url": "https://kernel.ubuntu.com/mainline/v6.19.14/amd64/linux-headers-6.19.14-061914_6.19.14-061914.202604221411_all.deb",
+        "sha256": "8899589f6451aa827736820997c98008d1f5481f872f82a433359afedc27d356"
+      }
+    ]
+  },
+  "mainline7": {
+    "release": "7.3.1-070301-generic",
+    "compiler": "gcc-15",
+    "container": "ubuntu:26.04",
+    "upstream": "Linux 7.3.1, Ubuntu Mainline build",
+    "headers": [
+      {
+        "url": "https://kernel.ubuntu.com/mainline/v7.3.1/amd64/linux-headers-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb",
+        "sha256": "b2080c067f68c48fa25fe6bc145916693440c58bcb3e3beb327219657b49144b"
+      },
+      {
+        "url": "https://kernel.ubuntu.com/mainline/v7.3.1/amd64/linux-headers-7.3.1-070301_7.3.1-070301.202610301300_all.deb",
+        "sha256": "b921b66c906d7e2c7273524a0dc3f10c6e46534aefac1b2c3ac9cc9f6f813f9c"
+      }
+    ]
+  }
+}

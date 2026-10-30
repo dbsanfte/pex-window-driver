@@ -1,16 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/** @file test_plan.c
+ * @brief CTest coverage for allocation capacity, alignment, and exhaustion.
+ */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include "../plan.h"
 
+/** @brief Verify that five VRAM/auxiliary BAR pairs fit in their slot windows. */
 static void five_gpus(void)
 {
     pw_u64 root = 0x120000000000ULL, limit = root + (512 * PW_GIB) - 1;
     pw_u64 a, b, bar, end, aux, auxend;
     for (unsigned int i = 0; i < 5; ++i) {
-        assert(!pw_place(root + i * PW_SLOT_BYTES, limit, PW_SLOT_BYTES,
-                         PW_SLOT_BYTES, &a, &b));
+        assert(!pw_place(root + i * PW_SLOT_BYTES, limit, PW_SLOT_BYTES, PW_SLOT_BYTES, &a, &b));
         assert(!pw_place(a, b, 32 * PW_GIB, 32 * PW_GIB, &bar, &end));
         /* NVIDIA's 32 MiB auxiliary BAR is larger than AMD's 2 MiB BAR. */
         assert(!pw_place(end + 1, b, 32ULL << 20, 32ULL << 20, &aux, &auxend));
@@ -21,12 +24,12 @@ static void five_gpus(void)
     /* Five independently aligned AMD windows cannot fit in 256 GiB. */
     pw_u64 cursor = 0;
     for (unsigned int i = 0; i < 5; ++i) {
-        assert(!pw_place(cursor, UINT64_MAX - 1, 32 * PW_GIB + (2ULL << 20),
-                         32 * PW_GIB, &a, &b));
+        assert(!pw_place(cursor, UINT64_MAX - 1, 32 * PW_GIB + (2ULL << 20), 32 * PW_GIB, &a, &b));
         cursor = b + 1;
     }
     assert(cursor == 288 * PW_GIB + (2ULL << 20));
 }
+/** @brief Verify containment and separation of a one-plus-two-plus-two slot hierarchy. */
 static void nested_branches(void)
 {
     const unsigned int slots[] = {1, 2, 2};
@@ -37,8 +40,7 @@ static void nested_branches(void)
         assert(i == 0 || last < a);
         for (unsigned int j = 0; j < slots[i]; ++j) {
             pw_u64 child, end;
-            assert(!pw_place(a + j * PW_SLOT_BYTES, b, PW_SLOT_BYTES,
-                             PW_SLOT_BYTES, &child, &end));
+            assert(!pw_place(a + j * PW_SLOT_BYTES, b, PW_SLOT_BYTES, PW_SLOT_BYTES, &child, &end));
             assert(child >= a && end <= b);
         }
         cursor = b + 1;
@@ -46,6 +48,7 @@ static void nested_branches(void)
     }
     assert(cursor == 320 * PW_GIB);
 }
+/** @brief Exercise zero sizes, invalid alignment, aperture edges, and unsigned overflow. */
 static void boundaries(void)
 {
     pw_u64 a, b;
@@ -61,6 +64,7 @@ static void boundaries(void)
     assert(a == 4096 && b == 8191);
     assert(pw_place(1, 8190, 4096, 4096, &a, &b));
 }
+/** @brief Verify inclusive overlap semantics and alignment after occupied regions. */
 static void conflicts(void)
 {
     assert(pw_overlap(0, 10, 10, 20));
@@ -71,11 +75,11 @@ static void conflicts(void)
     pw_u64 a, b;
     assert(!pw_place(0, 1024 * PW_GIB - 1, (512 * PW_GIB), (512 * PW_GIB), &a, &b));
     assert(pw_overlap(a, b, 64 * PW_GIB, 65 * PW_GIB - 1));
-    assert(!pw_place(65 * PW_GIB, 1024 * PW_GIB - 1, (512 * PW_GIB),
-                     (512 * PW_GIB), &a, &b));
+    assert(!pw_place(65 * PW_GIB, 1024 * PW_GIB - 1, (512 * PW_GIB), (512 * PW_GIB), &a, &b));
     assert(a == 512 * PW_GIB && b == 1024 * PW_GIB - 1);
     assert(!pw_overlap(a, b, 64 * PW_GIB, 65 * PW_GIB - 1));
 }
+/** @brief Exercise arbitrary slot counts, checked multiplication, and insufficient capacity. */
 static void capacity(void)
 {
     pw_u64 bytes, a, b;
@@ -87,6 +91,7 @@ static void capacity(void)
     assert(pw_place(0, 256 * PW_GIB - 1, bytes, PW_SLOT_BYTES, &a, &b));
     assert(!pw_place(0, 512 * PW_GIB - 1, bytes, PW_SLOT_BYTES, &a, &b));
 }
+/** @brief Place 1,024 variable-capacity trees and check every pair for overlap. */
 static void many_switches(void)
 {
     /* Hundreds of independently reserved PEX trees, no 8-tree/5-GPU ceiling. */
@@ -96,8 +101,7 @@ static void many_switches(void)
     for (; n < 1024; ++n) {
         pw_u64 slots = 1 + n % 13;
         assert(!pw_slot_span(slots, PW_SLOT_BYTES, &span));
-        if (pw_find_space(base, limit, span, PW_SLOT_BYTES, used, n,
-                          &used[n].start, &used[n].end))
+        if (pw_find_space(base, limit, span, PW_SLOT_BYTES, used, n, &used[n].start, &used[n].end))
             break;
         assert(used[n].start >= base && used[n].end <= limit);
         assert(used[n].end - used[n].start + 1 == span);
@@ -106,14 +110,15 @@ static void many_switches(void)
     }
     assert(n == 1024);
 }
+/** @brief Fill a shared aperture exactly, reject overflow, and retain independent apertures. */
 static void shared_aperture(void)
 {
     struct pw_interval used[5];
     pw_u64 a, b;
     /* Three five-GPU trees fit in 1 TiB. A fourth must fail atomically at plan time. */
     for (unsigned int i = 0; i < 3; ++i)
-        assert(!pw_find_space(0, 1024 * PW_GIB - 1, 320 * PW_GIB, PW_SLOT_BYTES,
-                              used, i, &used[i].start, &used[i].end));
+        assert(!pw_find_space(0, 1024 * PW_GIB - 1, 320 * PW_GIB, PW_SLOT_BYTES, used, i,
+                              &used[i].start, &used[i].end));
     assert(pw_find_space(0, 1024 * PW_GIB - 1, 320 * PW_GIB, PW_SLOT_BYTES, used, 3, &a, &b));
     /* Exact exhaustion: the final 64 GiB slot is usable, one byte more is not. */
     assert(!pw_find_space(0, 1024 * PW_GIB - 1, PW_SLOT_BYTES, PW_SLOT_BYTES, used, 3, &a, &b));
@@ -121,9 +126,10 @@ static void shared_aperture(void)
     used[3] = (struct pw_interval){a, b};
     assert(pw_find_space(0, 1024 * PW_GIB - 1, 1, 1, used, 4, &a, &b));
     /* A disjoint host aperture has its own capacity. */
-    assert(!pw_find_space(2ULL << 40, (3ULL << 40) - 1, 320 * PW_GIB,
-                          PW_SLOT_BYTES, used, 4, &a, &b));
+    assert(
+        !pw_find_space(2ULL << 40, (3ULL << 40) - 1, 320 * PW_GIB, PW_SLOT_BYTES, used, 4, &a, &b));
 }
+/** @brief Find gaps among unsorted reservations, including the maximum address limit. */
 static void fragmentation(void)
 {
     /* Unsorted firmware reservations, one crossing the lower aperture boundary. */
@@ -136,18 +142,33 @@ static void fragmentation(void)
     assert(!pw_find_space(UINT64_MAX - 7, UINT64_MAX, 8, 8, NULL, 0, &a, &b));
     assert(b == UINT64_MAX);
 }
+/**
+ * @brief Dispatch the CTest case named on the command line.
+ * @param argc Argument count, expected to be two.
+ * @param argv Program name and test-case name.
+ * @return Zero for a passing case, two for an unknown case; assertions abort on failure.
+ */
 int main(int argc, char **argv)
 {
     assert(argc == 2);
-    if (!strcmp(argv[1], "five_gpus")) five_gpus();
-    else if (!strcmp(argv[1], "nested_branches")) nested_branches();
-    else if (!strcmp(argv[1], "boundaries")) boundaries();
-    else if (!strcmp(argv[1], "conflicts")) conflicts();
-    else if (!strcmp(argv[1], "capacity")) capacity();
-    else if (!strcmp(argv[1], "many_switches")) many_switches();
-    else if (!strcmp(argv[1], "shared_aperture")) shared_aperture();
-    else if (!strcmp(argv[1], "fragmentation")) fragmentation();
-    else return 2;
+    if (!strcmp(argv[1], "five_gpus"))
+        five_gpus();
+    else if (!strcmp(argv[1], "nested_branches"))
+        nested_branches();
+    else if (!strcmp(argv[1], "boundaries"))
+        boundaries();
+    else if (!strcmp(argv[1], "conflicts"))
+        conflicts();
+    else if (!strcmp(argv[1], "capacity"))
+        capacity();
+    else if (!strcmp(argv[1], "many_switches"))
+        many_switches();
+    else if (!strcmp(argv[1], "shared_aperture"))
+        shared_aperture();
+    else if (!strcmp(argv[1], "fragmentation"))
+        fragmentation();
+    else
+        return 2;
     puts("PASS");
     return 0;
 }
