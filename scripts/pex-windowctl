@@ -111,6 +111,9 @@ def main():
         "--module", type=Path, default=Path(__file__).resolve().parents[1] / "pex_window.ko"
     )
     parser.add_argument("--roots", default="")
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable kernel debug-priority transaction traces"
+    )
     parser.add_argument("--bar-gib", type=int, default=32)
     parser.add_argument("--slot-gib", type=int, default=64)
     parser.add_argument("--empty-min-width", type=int, default=8)
@@ -133,6 +136,7 @@ def main():
             f"bar_gib={args.bar_gib}",
             f"slot_gib={args.slot_gib}",
             f"empty_min_width={args.empty_min_width}",
+            f"debug={int(args.debug)}",
         ]
         if args.mode == "plan":
             result = run("insmod", str(args.module), "apply=0", *module_args, check=False)

@@ -34,6 +34,11 @@
 static bool apply;
 module_param(apply, bool, 0444);
 MODULE_PARM_DESC(apply, "Apply allocation (default: read-only plan)");
+/** @brief Enable detailed KERN_DEBUG trace messages; writable at runtime. */
+static bool debug;
+module_param(debug, bool, 0644);
+MODULE_PARM_DESC(debug,
+                 "Verbose PCI/resource trace; boot: pex_window.debug=1, runtime: parameters/debug");
 /** @brief Transaction fault-injection point; zero disables injection. */
 static unsigned int fail_step;
 module_param(fail_step, uint, 0444);
@@ -121,6 +126,28 @@ static struct context *ctx;
 static DEFINE_MUTEX(operation_lock);
 
 /**
+ * @brief Emit optional diagnostic traces at kernel debug priority.
+ * @param d PCI device to identify, or NULL for a transaction-wide event.
+ * @param format Printf-style trace message, including its final newline.
+ * @param ... Values corresponding to the message format.
+ */
+static __printf(2, 3) void pw_trace(struct pci_dev *d, const char *format, ...)
+{
+    struct va_format message;
+    va_list arguments;
+    if (!READ_ONCE(debug))
+        return;
+    va_start(arguments, format);
+    message.fmt = format;
+    message.va = &arguments;
+    if (d)
+        dev_printk(KERN_DEBUG, &d->dev, "pex_window: debug: %pV", &message);
+    else
+        printk(KERN_DEBUG "pex_window: debug: %pV", &message);
+    va_end(arguments);
+}
+
+/**
  * @brief Recognize supported Broadcom/PLX PEX PCIe functions.
  * @param d PCI function to identify.
  * @return True for recognized switch-family functions.
@@ -158,7 +185,10 @@ static bool pref64(struct resource *r)
  */
 static int cfg_word(struct pci_dev *d, int pos, u16 *v)
 {
-    return pci_read_config_word(d, pos, v) ? -EIO : 0;
+    int status = pci_read_config_word(d, pos, v);
+    if (status)
+        pci_err(d, "pex_window: config read16 offset=%#x failed, PCI status=%#x\n", pos, status);
+    return status ? -EIO : 0;
 }
 /**
  * @brief Read a configuration dword and normalize PCI errors to errno.
@@ -169,7 +199,10 @@ static int cfg_word(struct pci_dev *d, int pos, u16 *v)
  */
 static int cfg_dword(struct pci_dev *d, int pos, u32 *v)
 {
-    return pci_read_config_dword(d, pos, v) ? -EIO : 0;
+    int status = pci_read_config_dword(d, pos, v);
+    if (status)
+        pci_err(d, "pex_window: config read32 offset=%#x failed, PCI status=%#x\n", pos, status);
+    return status ? -EIO : 0;
 }
 
 /**
@@ -193,8 +226,10 @@ static int gather_one(struct pci_dev *d, int parent, int ti)
     n->tree = ti;
     n->vram_bar = -1;
     ret = pm_runtime_resume_and_get(&d->dev);
-    if (ret < 0)
+    if (ret < 0) {
+        pci_err(d, "pex_window: runtime resume failed during discovery (%d)\n", ret);
         return ret;
+    }
     n->powered = true;
     if (cfg_word(d, PCI_COMMAND, &n->command))
         return -EIO;
@@ -225,6 +260,10 @@ static int gather_one(struct pci_dev *d, int parent, int ti)
                 "pex_window: foreign endpoint in target tree; use roots= to restrict discovery\n");
         return -ENODEV;
     }
+    pw_trace(d,
+             "discovered vendor=%04x device=%04x class=%06x parent=%d tree=%d leaf_slots=%llu "
+             "command=%#x\n",
+             d->vendor, d->device, d->class, parent, ti, n->slots, n->command);
     return idx;
 }
 
@@ -274,8 +313,7 @@ static int discover(void)
 {
     struct pci_dev *d = NULL, *child;
     int ret, i, count = 0;
-    for_each_pci_dev(d)
-    {
+    for_each_pci_dev (d) {
         if (count == INT_MAX / PCI_STD_NUM_BARS) {
             pci_dev_put(d);
             return -EOVERFLOW;
@@ -288,8 +326,7 @@ static int discover(void)
     ctx->trees = kvcalloc(count, sizeof(*ctx->trees), GFP_KERNEL);
     if (!ctx->nodes || !ctx->maps || !ctx->trees)
         return -ENOMEM;
-    for_each_pci_dev(d)
-    {
+    for_each_pci_dev (d) {
         struct tree *t;
         bool found = false;
         if (!pci_is_root_bus(d->bus) || !pci_is_bridge(d) || !d->subordinate ||
@@ -308,8 +345,7 @@ static int discover(void)
             struct pci_bus *bus = ctx->nodes[i].dev->subordinate;
             if (!bus)
                 continue;
-            list_for_each_entry(child, &bus->devices, bus_list)
-            {
+            list_for_each_entry (child, &bus->devices, bus_list) {
                 ret = gather_one(child, i, ctx->tree_count);
                 if (ret < 0)
                     goto fail;
@@ -332,13 +368,19 @@ static int discover(void)
         }
         t->host = d->resource[PREF_RES].parent;
         if (!(t->host->flags & IORESOURCE_MEM) || t->host->start < (1ULL << 32)) {
+            pci_err(d, "pex_window: root requires an above-4GiB memory aperture, found %pR\n",
+                    t->host);
             ret = -ENOSPC;
             goto fail;
         }
+        pw_trace(d, "host aperture %pR; original root window %pR\n", t->host,
+                 &d->resource[PREF_RES]);
         pci_info(d, "pex_window: discovered %llu slots, requires %llu GiB\n",
                  ctx->nodes[t->root].slots, t->bytes / PW_GIB);
         ctx->tree_count++;
     }
+    if (!ctx->tree_count)
+        pr_err("pex_window: no eligible PEX root trees found (roots=%s)\n", roots ? roots : "auto");
     return ctx->tree_count ? 0 : -ENODEV;
 fail:
     pci_dev_put(d);
@@ -357,28 +399,48 @@ static int rebar_plan(struct node *n)
     int pos, count, i, size = ilog2(bar_gib) + 10;
     u32 ctrl, cap;
     n->vram_bytes = max_t(u64, resource_size(r), (u64)bar_gib * PW_GIB);
-    if (!pref64(r) || n->vram_bytes > (u64)slot_gib * PW_GIB)
+    if (!pref64(r) || n->vram_bytes > (u64)slot_gib * PW_GIB) {
+        pci_err(d, "pex_window: BAR%d cannot fit requested %llu GiB in %u GiB slot, resource=%pR\n",
+                n->vram_bar, n->vram_bytes / PW_GIB, slot_gib, r);
         return -EINVAL;
-    if (resource_size(r) == n->vram_bytes)
+    }
+    if (resource_size(r) == n->vram_bytes) {
+        pw_trace(d, "BAR%d already %llu GiB; preserving size\n", n->vram_bar,
+                 n->vram_bytes / PW_GIB);
         return 0;
+    }
     pos = pci_find_ext_capability(d, PCI_EXT_CAP_ID_REBAR);
-    if (!pos || cfg_dword(d, pos + PCI_REBAR_CTRL, &ctrl))
+    if (!pos) {
+        pci_err(d, "pex_window: BAR%d needs enlargement but no ReBAR capability is present\n",
+                n->vram_bar);
         return -ENOTSUPP;
+    }
+    if (cfg_dword(d, pos + PCI_REBAR_CTRL, &ctrl))
+        return -EIO;
     count = (ctrl & PCI_REBAR_CTRL_NBAR_MASK) >> PCI_REBAR_CTRL_NBAR_SHIFT;
-    if (!count || count > PCI_STD_NUM_BARS)
+    if (!count || count > PCI_STD_NUM_BARS) {
+        pci_err(d, "pex_window: invalid ReBAR entry count %d at offset=%#x control=%#x\n", count,
+                pos, ctrl);
         return -EINVAL;
+    }
     for (i = 0; i < count; i++, pos += 8) {
         if (cfg_dword(d, pos + PCI_REBAR_CTRL, &ctrl) || cfg_dword(d, pos + PCI_REBAR_CAP, &cap))
             return -EIO;
         if ((ctrl & PCI_REBAR_CTRL_BAR_IDX) != n->vram_bar)
             continue;
-        if (!(cap & BIT(size + 4)))
+        if (!(cap & BIT(size + 4))) {
+            pci_err(d, "pex_window: BAR%d does not support %u GiB; ReBAR size mask=%#x\n",
+                    n->vram_bar, bar_gib, cap >> 4);
             return -ENOTSUPP;
+        }
+        pci_info(d, "pex_window: BAR%d resize planned: %llu MiB -> %u GiB\n", n->vram_bar,
+                 (u64)resource_size(r) >> 20, bar_gib);
         n->rebar_offset = pos + PCI_REBAR_CTRL;
         n->rebar_old = ctrl;
         n->rebar_new = (ctrl & ~PCI_REBAR_CTRL_BAR_SIZE) | (size << PCI_REBAR_CTRL_BAR_SHIFT);
         return 0;
     }
+    pci_err(d, "pex_window: no ReBAR control entry for VRAM BAR%d\n", n->vram_bar);
     return -ENOTSUPP;
 }
 
@@ -425,8 +487,11 @@ static int add_map(int ni, int bar, struct resource *parent, resource_size_t sta
             return -EINVAL;
         }
     }
-    pci_info(d, "pex_window: plan resource %d [%#llx-%#llx] (%llu MiB)\n", bar, (u64)start,
-             (u64)end, (u64)(end - start + 1) >> 20);
+    if (!apply)
+        pci_info(d, "pex_window: plan resource %d [%#llx-%#llx] (%llu MiB)\n", bar, (u64)start,
+                 (u64)end, (u64)(end - start + 1) >> 20);
+    pw_trace(d, "resource %d original=%pR planned=[%#llx-%#llx] parent=%pR\n", bar, r, (u64)start,
+             (u64)end, parent);
     return 0;
 }
 
@@ -463,8 +528,13 @@ static int plan_tree(struct tree *t)
         n->cursor = n->start;
         if (pci_is_bridge(d)) {
             if (d->subordinate->resource[2] != &d->resource[PREF_RES] ||
-                (n->pref_regs[0] & 0x000f000f) != 0x00010001)
+                (n->pref_regs[0] & 0x000f000f) != 0x00010001) {
+                pci_err(d,
+                        "pex_window: bridge lacks a supported 64-bit prefetch window "
+                        "(base/limit=%#x)\n",
+                        n->pref_regs[0]);
                 return -ENOTSUPP;
+            }
             for (i = 0; i < PCI_STD_NUM_BARS; i++)
                 if (d->resource[i].flags & IORESOURCE_PREFETCH)
                     return -ENOTSUPP;
@@ -483,8 +553,13 @@ static int plan_tree(struct tree *t)
                 if (!pref64(r))
                     return -ENOTSUPP;
                 bytes = bar == n->vram_bar ? n->vram_bytes : resource_size(r);
-                if (pw_place(n->cursor, n->end, bytes, bytes, &a, &b) || b == U64_MAX)
+                if (pw_place(n->cursor, n->end, bytes, bytes, &a, &b) || b == U64_MAX) {
+                    pci_err(d,
+                            "pex_window: BAR%d (%llu MiB) does not fit slot [%#llx-%#llx]; "
+                            "increase slot_gib\n",
+                            bar, bytes >> 20, n->start, n->end);
                     return -ENOSPC;
+                }
                 ret = add_map(ni, bar, pr, a, b);
                 if (ret)
                     return ret;
@@ -559,8 +634,12 @@ static int make_plan(void)
             for (j = 0; j < ctx->mapping_count; j++)
                 if (ctx->maps[j].res == child)
                     break;
-            if (j == ctx->mapping_count)
+            if (j == ctx->mapping_count) {
+                pci_err(ctx->nodes[ctx->maps[i].node].dev,
+                        "pex_window: resource %d has an unmapped/claimed child %pR\n",
+                        ctx->maps[i].bar, child);
                 return -EBUSY;
+            }
         }
     }
     return 0;
@@ -640,7 +719,11 @@ static int acquire_power(void)
  */
 static int write_command(void *opaque, pw_u16 value)
 {
-    return pci_write_config_word(opaque, PCI_COMMAND, value);
+    struct pci_dev *d = opaque;
+    int status = pci_write_config_word(d, PCI_COMMAND, value);
+    if (status)
+        pci_err(d, "pex_window: COMMAND write=%#x failed, PCI status=%#x\n", value, status);
+    return status;
 }
 /**
  * @brief Command-word read adapter for the shared readback helper.
@@ -667,8 +750,16 @@ static int commands(void *opaque, bool disable)
         u16 cmd = n->command;
         if (disable)
             cmd &= ~(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-        if (pw_verified_word(write_command, read_command, n->dev, cmd))
+        if (pw_verified_word(write_command, read_command, n->dev, cmd)) {
+            u16 actual;
+            if (!cfg_word(n->dev, PCI_COMMAND, &actual))
+                pci_err(n->dev,
+                        "pex_window: %s COMMAND verification failed: expected=%#x actual=%#x\n",
+                        disable ? "disable" : "restore", cmd, actual);
             ret = -EIO;
+        } else {
+            pw_trace(n->dev, "%s COMMAND=%#x verified\n", disable ? "disable" : "restore", cmd);
+        }
     }
     return ret;
 }
@@ -682,8 +773,14 @@ static int drain_pending(void *opaque)
     int i;
     for (i = 0; i < ctx->node_count; i++) {
         struct pci_dev *d = ctx->nodes[i].dev;
-        if (!pci_is_bridge(d) && !pci_wait_for_pending_transaction(d))
+        if (!pci_is_bridge(d) && !pci_wait_for_pending_transaction(d)) {
+            pci_err(
+                d,
+                "pex_window: pending PCIe transactions did not drain after disabling mastering\n");
             return -EBUSY;
+        }
+        if (!pci_is_bridge(d))
+            pw_trace(d, "quiesced; pending transaction check passed\n");
     }
     return 0;
 }
@@ -696,9 +793,15 @@ static int drain_pending(void *opaque)
 static int release_maps(void *opaque)
 {
     int i;
-    for (i = ctx->mapping_count - 1; i >= 0; i--)
-        if (ctx->maps[i].res->parent && release_resource(ctx->maps[i].res))
+    for (i = ctx->mapping_count - 1; i >= 0; i--) {
+        struct mapping *m = &ctx->maps[i];
+        struct pci_dev *d = ctx->nodes[m->node].dev;
+        pw_trace(d, "release resource %d %pR\n", m->bar, m->res);
+        if (m->res->parent && release_resource(m->res)) {
+            pci_err(d, "pex_window: release failed for resource %d %pR\n", m->bar, m->res);
             return -EBUSY;
+        }
+    }
     return 0;
 }
 /**
@@ -718,13 +821,44 @@ static int register_maps(void *opaque, bool restore)
         r->end = restore ? m->old_end : m->end;
         r->flags = restore ? m->old_flags : m->flags;
         r->name = restore ? m->old_name : pci_name(ctx->nodes[m->node].dev);
+        pw_trace(ctx->nodes[m->node].dev, "%s register resource %d %pR parent=%pR\n",
+                 restore ? "original" : "planned", m->bar, r, parent);
         if (parent && request_resource(parent, r)) {
-            pr_err("pex_window: resource registration failed for %s/%d\n", r->name, m->bar);
+            pci_err(ctx->nodes[m->node].dev,
+                    "pex_window: %s registration failed: resource %d %pR parent=%pR\n",
+                    restore ? "original" : "planned", m->bar, r, parent);
             return -ENOSPC;
         }
     }
     return 0;
 }
+/**
+ * @brief Write/read back one configuration dword with precise failure context.
+ * @param d Target PCI function.
+ * @param offset Configuration-space byte offset.
+ * @param expected Required register value.
+ * @return Zero on matching readback, -EIO on write/read/mismatch failure.
+ */
+static int write_checked_dword(struct pci_dev *d, int offset, u32 expected)
+{
+    u32 actual;
+    int status = pci_write_config_dword(d, offset, expected);
+    if (status) {
+        pci_err(d, "pex_window: config write32 offset=%#x value=%#x failed, PCI status=%#x\n",
+                offset, expected, status);
+        return -EIO;
+    }
+    if (cfg_dword(d, offset, &actual))
+        return -EIO;
+    if (actual != expected) {
+        pci_err(d, "pex_window: config verify32 offset=%#x expected=%#x actual=%#x\n", offset,
+                expected, actual);
+        return -EIO;
+    }
+    pw_trace(d, "config32 offset=%#x value=%#x verified\n", offset, expected);
+    return 0;
+}
+
 /**
  * @brief Write and read back ReBAR controls, BARs, and bridge windows.
  * @param opaque Backend context, unused because the module retains one transaction.
@@ -735,14 +869,13 @@ static int register_maps(void *opaque, bool restore)
 static int program_config(void *opaque, bool restore)
 {
     int i, error = 0;
-    u32 readback;
+    pw_trace(NULL, "%s hardware configuration\n", restore ? "restore original" : "program planned");
     for (i = 0; i < ctx->node_count; i++) {
         struct node *n = &ctx->nodes[i];
         u32 ctrl = restore ? n->rebar_old : n->rebar_new;
         if (!n->rebar_offset)
             continue;
-        if (pci_write_config_dword(n->dev, n->rebar_offset, ctrl) ||
-            cfg_dword(n->dev, n->rebar_offset, &readback) || readback != ctrl)
+        if (write_checked_dword(n->dev, n->rebar_offset, ctrl))
             error = -EIO;
     }
     for (i = 0; i < ctx->mapping_count; i++) {
@@ -769,8 +902,7 @@ static int program_config(void *opaque, bool restore)
             count = 2;
         }
         for (j = 0; j < count; j++)
-            if (pci_write_config_dword(d, offsets[j], regs[j]) ||
-                cfg_dword(d, offsets[j], &readback) || readback != regs[j])
+            if (write_checked_dword(d, offsets[j], regs[j]))
                 error = -EIO;
     }
     return error;
@@ -784,8 +916,12 @@ static int save_states(void *opaque)
 {
     int i, ret = 0;
     for (i = 0; i < ctx->node_count; i++)
-        if (pci_save_state(ctx->nodes[i].dev))
+        if (pci_save_state(ctx->nodes[i].dev)) {
+            pci_err(ctx->nodes[i].dev, "pex_window: PCI saved-state refresh failed\n");
             ret = -EIO;
+        } else {
+            pw_trace(ctx->nodes[i].dev, "saved PCI state for runtime resume\n");
+        }
     return ret;
 }
 /** @brief Production backend for the transaction engine tested by CTest. */
@@ -817,7 +953,12 @@ static void report_containment(int error)
 static int perform(void)
 {
     struct pw_outcome outcome;
-    int ret = pw_apply(&operations, ctx, fail_step, &outcome);
+    int ret;
+    pr_info("pex_window: applying %d resource mappings across %d devices\n", ctx->mapping_count,
+            ctx->node_count);
+    if (fail_step)
+        pr_warn("pex_window: test fault injection enabled at step %u\n", fail_step);
+    ret = pw_apply(&operations, ctx, fail_step, &outcome);
     if (!ret) {
         ctx->changed = true;
         pr_info("pex_window: APPLIED: %d trees, %u GiB per slot, target VRAM BAR %u GiB\n",
@@ -860,11 +1001,18 @@ static int verify_rollback_layout(void *opaque)
     for (i = 0; i < ctx->mapping_count; i++) {
         struct mapping *m = &ctx->maps[i];
         struct resource *child;
-        if (m->res->parent != m->new_parent || m->res->start != m->start || m->res->end != m->end)
+        if (m->res->parent != m->new_parent || m->res->start != m->start || m->res->end != m->end) {
+            pci_err(ctx->nodes[m->node].dev,
+                    "pex_window: rollback refused: resource %d changed since apply\n", m->bar);
             return -EBUSY;
+        }
         for (child = m->res->child; child; child = child->sibling) {
-            if (!mapped_resource(child))
+            if (!mapped_resource(child)) {
+                pci_err(ctx->nodes[m->node].dev,
+                        "pex_window: rollback refused: resource %d acquired child %pR\n", m->bar,
+                        child);
                 return -EBUSY;
+            }
         }
         if (m->old_parent) {
             struct pw_interval *used;
@@ -891,8 +1039,13 @@ static int verify_rollback_layout(void *opaque)
             error = pw_original_range_free(m->old_start, m->old_end, parent_start, parent_end, used,
                                            count);
             kvfree(used);
-            if (error)
+            if (error) {
+                pci_err(ctx->nodes[m->node].dev,
+                        "pex_window: rollback refused: original resource %d [%#llx-%#llx] is no "
+                        "longer available\n",
+                        m->bar, (u64)m->old_start, (u64)m->old_end);
                 return -EBUSY;
+            }
         }
     }
     return 0;
@@ -913,9 +1066,11 @@ static int rollback_set(const char *value, const struct kernel_param *kp)
         return ret ? ret : -EINVAL;
     mutex_lock(&operation_lock);
     if (!ctx || !ctx->changed) {
+        pr_err("pex_window: rollback refused: no applied transaction to restore\n");
         ret = -EINVAL;
         goto out;
     }
+    pr_info("pex_window: explicit rollback requested\n");
     pci_lock_rescan_remove();
     ret = acquire_power();
     if (!ret)
@@ -938,6 +1093,10 @@ static int rollback_set(const char *value, const struct kernel_param *kp)
     pci_unlock_rescan_remove();
 out:
     mutex_unlock(&operation_lock);
+    if (ret)
+        pr_err("pex_window: explicit rollback did not complete (%d); inspect preceding device "
+               "diagnostics\n",
+               ret);
     return ret;
 }
 /** @brief Write-only parameter operations for explicit rollback. */
@@ -971,23 +1130,42 @@ static void cleanup(void)
  */
 static int __init pex_window_init(void)
 {
+    const char *stage = "discovery";
     int ret;
-    if (!IS_ENABLED(CONFIG_X86_64))
+    if (!IS_ENABLED(CONFIG_X86_64)) {
+        pr_err("pex_window: only x86-64 identity-addressed PCI MMIO is supported\n");
         return -ENOTSUPP;
+    }
     if (!is_power_of_2(bar_gib) || bar_gib > (1U << 17) || !is_power_of_2(slot_gib) ||
-        slot_gib < bar_gib || empty_min_width > 32 || fail_step > 2)
+        slot_gib < bar_gib || empty_min_width > 32 || fail_step > 2) {
+        pr_err(
+            "pex_window: invalid policy: bar_gib=%u slot_gib=%u empty_min_width=%u fail_step=%u\n",
+            bar_gib, slot_gib, empty_min_width, fail_step);
         return -EINVAL;
+    }
+    pr_info("pex_window: version=%s mode=%s roots=%s bar=%uGiB slot=%uGiB empty_min_width=%u "
+            "debug=%u\n",
+            PW_VERSION, apply ? "apply" : "dry-run", roots ? roots : "auto", bar_gib, slot_gib,
+            empty_min_width, READ_ONCE(debug));
     ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx)
+    if (!ctx) {
+        pr_err("pex_window: cannot allocate transaction context\n");
         return -ENOMEM;
+    }
     pci_lock_rescan_remove();
     ret = discover();
-    if (!ret && apply)
+    if (!ret && apply) {
+        stage = "endpoint-lock";
         ret = lock_endpoints();
-    if (!ret)
+    }
+    if (!ret) {
+        stage = "planning";
         ret = make_plan();
-    if (!ret && apply)
+    }
+    if (!ret && apply) {
+        stage = "application/recovery";
         ret = perform();
+    }
     if (!ret && !apply)
         pr_info("pex_window: DRY RUN: %d trees, %d devices, %d resources; no allocations changed\n",
                 ctx->tree_count, ctx->node_count, ctx->mapping_count);
@@ -995,7 +1173,8 @@ static int __init pex_window_init(void)
     release_power();
     pci_unlock_rescan_remove();
     if (ret) {
-        pr_err("pex_window: aborted (%d)\n", ret);
+        pr_err("pex_window: aborted during %s: %pe (%d); inspect preceding device diagnostics\n",
+               stage, ERR_PTR(ret), ret);
         cleanup();
     }
     return ret;
