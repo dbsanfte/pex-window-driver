@@ -3,10 +3,30 @@ on:
   pull_request:
     branches: [master]
   workflow_call:
+    inputs:
+      version:
+        description: Module version for release artifacts
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: matrix
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          targets = json.loads(Path('ci/kernel-targets.json').read_text())
+          print('matrix=' + json.dumps({'include': [dict(target=name, **value) for name, value in targets.items()]}))
+          PY
   unit:
     name: CTest
     runs-on: ubuntu-24.04
@@ -15,35 +35,73 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SANITIZERS=ON
       - run: cmake --build build --parallel
       - run: ctest --test-dir build --output-on-failure
-      - run: python3 -m py_compile scripts/pex-windowctl tests/cuda_smoke.py
+      - run: python3 -m py_compile scripts/pex-windowctl scripts/install_driver.py scripts/prepare-kernel.py scripts/package-binary.py tests/test_install.py tests/cuda_smoke.py
       - run: bash -n scripts/install scripts/uninstall scripts/package
-  module:
-    name: Module (${{ matrix.headers }})
+  docs:
+    name: Doxygen and formatting
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        headers: [linux-headers-generic, linux-headers-generic-hwe-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install kernel headers and compilers
+      - run: sudo apt-get update -qq && sudo apt-get install -y doxygen clang-format-18
+      - name: Require consistent C/C++ formatting
+        run: clang-format-18 --dry-run --Werror pex_window.c plan.h transaction.h tests/test_plan.c tests/test_transaction.c tests/hip_smoke.cpp
+      - name: Build documented API with warnings treated as errors
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential gcc-13 gcc-14 ${{ matrix.headers }}
-      - name: Build against distribution headers
+          mkdir -p build dist
+          doxygen Doxyfile
+          tar -cJf dist/pex-window-api-docs.tar.xz -C build/docs html
+          (cd dist && sha256sum pex-window-api-docs.tar.xz > pex-window-api-docs.tar.xz.sha256)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-docs
+          path: dist/*
+          if-no-files-found: error
+  module:
+    name: Module (${{ matrix.target }})
+    needs: targets
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - name: Install build tools in isolated container
+        env:
+          COMPILER: ${{ matrix.compiler }}
         run: |
-          kdir=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -1)
-          test -n "$kdir"
-          make -j2 KDIR="$kdir"
-          modinfo ./pex_window.ko
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential "$COMPILER" python3 git ca-certificates kmod libelf-dev libssl-dev xz-utils
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Extract checksum-pinned headers
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/prepare-kernel.py "$TARGET" --root /
+      - name: Build and package exact-ABI module
+        env:
+          TARGET: ${{ matrix.target }}
+          KERNEL_RELEASE: ${{ matrix.release }}
+          COMPILER: ${{ matrix.compiler }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then printf '%s\n' "$RELEASE_VERSION" > VERSION; fi
+          make -j2 KDIR="/usr/src/linux-headers-$KERNEL_RELEASE" CC="$COMPILER"
+          python3 scripts/package-binary.py "$TARGET" --headers "/usr/src/linux-headers-$KERNEL_RELEASE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
   gate:
     name: Test gate
     if: always()
-    needs: [unit, module]
+    needs: [targets, unit, docs, module]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require all tests and module builds
+      - name: Require tests, documentation, and all kernel builds
         env:
+          TARGETS: ${{ needs.targets.result }}
           UNIT: ${{ needs.unit.result }}
+          DOCS: ${{ needs.docs.result }}
           MODULE: ${{ needs.module.result }}
-        run: test "$UNIT" = success && test "$MODULE" = success
+        run: test "$TARGETS" = success && test "$UNIT" = success && test "$DOCS" = success && test "$MODULE" = success

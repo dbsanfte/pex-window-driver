@@ -1,0 +1,23 @@
+PROJECT_NAME           = "pex-window"
+PROJECT_BRIEF          = "Transactional PCIe MMIO allocation for PEX GPU trees"
+OUTPUT_DIRECTORY       = build/docs
+INPUT                  = pex_window.c plan.h transaction.h tests/test_plan.c tests/test_transaction.c tests/hip_smoke.cpp
+FILE_PATTERNS          = *.c *.h *.cpp
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = YES
+HIDE_UNDOC_MEMBERS      = NO
+HIDE_UNDOC_CLASSES      = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = YES
+WARN_LOGFILE           = build/doxygen-warnings.log
+QUIET                  = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HAVE_DOT               = NO
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION         = YES
+EXPAND_ONLY_PREDEF      = YES
+PREDEFINED             = __KERNEL__ __init= __exit= "module_param(a,b,c)=" "MODULE_PARM_DESC(a,b)=" "module_param_cb(a,b,c,d)=" "module_init(a)=" "module_exit(a)=" "MODULE_LICENSE(a)=" "MODULE_AUTHOR(a)=" "MODULE_DESCRIPTION(a)=" "MODULE_VERSION(a)=" "DEFINE_MUTEX(a)=struct mutex a"

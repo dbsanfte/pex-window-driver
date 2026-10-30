@@ -36,7 +36,9 @@ make -j4                       # current kernel
 # make KDIR=/path/to/headers    # another kernel
 ```
 
-Tests cover GPU/auxiliary BAR packing, nested branches, overflow and alignment boundaries, 1,024 switch trees, shared-aperture allocation, exact exhaustion, and fragmentation. Assertions remain enabled in release builds. AddressSanitizer and UndefinedBehaviorSanitizer are enabled in CI.
+CTest covers GPU/auxiliary BAR packing, nested branches, overflow and alignment boundaries, 1,024 switch trees, shared apertures, exact exhaustion, and fragmentation. It also exercises the **same transaction engine used by the module** with mocked PCI/resource operations: ignored command writes, disable-before-drain ordering, failures at each application stage, failed recovery containment, occupied original ranges, and fallback to the applied layout. Installer tests inject failures into source copies, DKMS add/build/install, configuration copies, and initramfs handling; they check cleanup ownership, delayed state publication, and uninstall retry. These tests do not emulate GPU hardware or replace live validation. Assertions remain enabled in release builds; address and undefined-behavior sanitizers run in CI.
+
+Source files, functions, parameters, return values, and transaction structures have Doxygen documentation. Build it with `cmake --build build --target docs` or `doxygen Doxyfile`; open `build/docs/html/index.html`. Documentation warnings fail CI. C/C++ formatting is checked with clang-format 18 using the checked-in configuration.
 
 ## Inspect, test, and apply on an idle host
 
@@ -54,7 +56,7 @@ The controller detects open GPU device files and refuses to proceed when they ar
 
 Do not start GPU jobs or manually reprobe devices during a live transaction. A running display or compute workload must be stopped first. The module independently requires every affected endpoint to be unbound and locks endpoint devices during allocation. Unrelated root trees, non-prefetchable BARs, bus numbers, and I/O windows are preserved.
 
-If a transaction cannot verify restoration, the controller leaves endpoints detached with their guards in place and power on; use its recorded evidence for recovery. Do not blindly rebind them. The module refuses an explicit rollback if resource ownership or the layout has changed since allocation. Unloading the module leaves the successfully allocated, PCI-owned resources in place. Reboot returns to firmware allocation unless boot integration reapplies the helper.
+If a transaction cannot verify restoration, the controller leaves endpoints detached with their guards in place and power on; use its recorded evidence for recovery. Do not blindly rebind them. The module refuses an explicit rollback if resource ownership or the layout has changed, or another allocation occupies an original range. A restoration failure attempts to recover the applied layout; unverified command-register disable is reported explicitly. Unloading the module leaves the successfully allocated, PCI-owned resources in place. Reboot returns to firmware allocation unless boot integration reapplies the helper.
 
 ## Install at boot (Ubuntu/Debian initramfs-tools + DKMS)
 
@@ -74,9 +76,23 @@ Uninstallation removes DKMS and boot integration and rebuilds initramfs images. 
 
 ## CI and releases
 
-Pull requests into `master` run CTest and build the module against Ubuntu 24.04 generic and HWE headers. The stable **Test gate** check succeeds only if both unit tests and both module builds pass. Branch protection should require it (private-repository enforcement depends on the account's GitHub plan).
+Pull requests into `master` run CTest, Doxygen, formatting checks, and builds for three exact x86-64 kernel ABIs. The required **Test gate** check succeeds only when every job passes; `master` branch protection also applies to administrators.
 
-Each push to `master`, including a merged PR, runs the same gate before publishing a GitHub release. Versions use the major/minor series in `VERSION` and the release workflow run number as the patch. Assets are a version-stamped **DKMS source archive** and SHA-256 checksum; machines build their own kernel-specific module. Release publication does not remotely install drivers.
+| Target | Kernel ABI | Build environment |
+| --- | --- | --- |
+| This workstation | `6.14.0-37-generic` | Ubuntu 24.04 HWE headers, GCC 13 |
+| Upstream Linux 6 | `6.19.14-061914-generic` | Ubuntu Mainline packaging of Linux 6.19.14, GCC 15 |
+| Upstream Linux 7 | `7.3.1-070301-generic` | Ubuntu Mainline packaging of Linux 7.3.1, GCC 15 |
+
+Exact header URLs and SHA-256 digests are pinned in [ci/kernel-targets.json](ci/kernel-targets.json). CI extracts the official header packages into isolated containers, including their real `Module.symvers`; it does not substitute a `modules_prepare` tree without symbol CRCs. These are compatibility build targets, not kernel upgrade recommendations.
+
+Every push to `master`, including merged PRs, repeats the complete gate and then publishes:
+
+- A version-stamped DKMS source archive for local kernel builds and signing.
+- One module archive per exact ABI above, including the unsigned `.ko`, kernel configuration, symbol table, compiler/version metadata, and source commit.
+- Generated Doxygen HTML documentation and SHA-256 checksums for every archive.
+
+Prebuilt modules are specific to their recorded ABI/configuration; there is no universal binary for all Linux 6.x or 7.x kernels. Use DKMS for another configuration. Versions use the major/minor series in `VERSION` and the release workflow run number as the patch. Publication does not remotely install drivers.
 
 ## Hardware validation
 

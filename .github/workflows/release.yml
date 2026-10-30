@@ -8,23 +8,41 @@ concurrency:
   group: release-master
   cancel-in-progress: false
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        run: |
+          series=$(cut -d. -f1,2 VERSION)
+          echo "version=$series.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
   test:
+    needs: version
     uses: ./.github/workflows/test.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
   publish:
-    needs: test
+    needs: [version, test]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Package DKMS source and publish release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Package DKMS source and publish verified artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          series=$(cut -d. -f1,2 VERSION)
-          version="$series.${GITHUB_RUN_NUMBER}"
-          scripts/package "$version"
-          tag="v$version"
+          scripts/package "$RELEASE_VERSION"
+          (cd dist && sha256sum --check *.sha256)
+          tag="v$RELEASE_VERSION"
           git tag "$tag" "$GITHUB_SHA"
           git push origin "$tag"
           gh release create "$tag" dist/* --verify-tag --title "$tag" --generate-notes

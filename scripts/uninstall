@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
+# Remove boot integration; retry remains safe after a failed initramfs rebuild.
 set -euo pipefail
-(( EUID == 0 )) || { echo 'Run as root' >&2; exit 1; }
-mapfile -t state < /var/lib/pex-window/install-state
-version=${state[0]}
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-rm -f /etc/modprobe.d/pex-window.conf /etc/initramfs-tools/hooks/pex-window /etc/initramfs-tools/scripts/init-top/00-pex-window
-dkms remove -m pex-window -v "$version" --all
-update-initramfs -u -k all
-if [[ -d /sys/module/pex_window ]]; then rmmod pex_window; fi
-rm -rf "/usr/src/pex-window-$version"
-echo 'Removed boot integration. Live PCI allocations persist until reboot; initramfs backups are retained.'
+exec python3 "$(dirname "$0")/install_driver.py" uninstall "$@"
