@@ -1,0 +1,6 @@
+#!/bin/sh
+PREREQ=""
+case "${1:-}" in prereqs) echo "$PREREQ"; exit 0 ;; esac
+# init-top runs before udev coldplug and load_modules. Failure leaves the
+# baseline layout in place after the module's verified transaction rollback.
+modprobe pex_window || echo 'pex-window: allocation helper failed; see kernel log' >&2

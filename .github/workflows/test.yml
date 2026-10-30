@@ -1,0 +1,49 @@
+name: Test
+on:
+  pull_request:
+    branches: [master]
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    name: CTest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SANITIZERS=ON
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
+      - run: python3 -m py_compile scripts/pex-windowctl tests/cuda_smoke.py
+      - run: bash -n scripts/install scripts/uninstall scripts/package
+  module:
+    name: Module (${{ matrix.headers }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        headers: [linux-headers-generic, linux-headers-generic-hwe-24.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kernel headers and compilers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gcc-13 gcc-14 ${{ matrix.headers }}
+      - name: Build against distribution headers
+        run: |
+          kdir=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -1)
+          test -n "$kdir"
+          make -j2 KDIR="$kdir"
+          modinfo ./pex_window.ko
+  gate:
+    name: Test gate
+    if: always()
+    needs: [unit, module]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all tests and module builds
+        env:
+          UNIT: ${{ needs.unit.result }}
+          MODULE: ${{ needs.module.result }}
+        run: test "$UNIT" = success && test "$MODULE" = success

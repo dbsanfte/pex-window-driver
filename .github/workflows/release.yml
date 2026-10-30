@@ -1,0 +1,30 @@
+name: Release
+on:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+concurrency:
+  group: release-master
+  cancel-in-progress: false
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Package DKMS source and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          series=$(cut -d. -f1,2 VERSION)
+          version="$series.${GITHUB_RUN_NUMBER}"
+          scripts/package "$version"
+          tag="v$version"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "$tag"
+          gh release create "$tag" dist/* --verify-tag --title "$tag" --generate-notes

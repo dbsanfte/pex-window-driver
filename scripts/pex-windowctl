@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Controlled live test/apply. Boot installation uses the module before driver probing."""
+import argparse
+import fcntl
+import glob
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+SYS = Path('/sys/bus/pci/devices')
+BDF = re.compile(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$')
+
+
+def run(*args, check=True):
+    return subprocess.run(args, check=check, text=True, capture_output=True)
+
+
+def number(path):
+    return int(path.read_text().strip(), 16)
+
+
+def discover(selected):
+    devices = sorted(SYS.iterdir())
+    roots = set()
+    for d in devices:
+        vendor, device = number(d / 'vendor'), number(d / 'device')
+        if number(d / 'class') >> 8 != 0x0604:
+            continue
+        if vendor != 0x10b5 and (vendor, device) != (0x1000, 0xc010):
+            continue
+        chain = [part for part in d.resolve().parts if BDF.match(part)]
+        if len(chain) > 1:
+            roots.add(chain[0])
+    if selected:
+        wanted = set(selected.split(','))
+        if wanted - roots:
+            raise RuntimeError(f'No PEX tree found under {sorted(wanted - roots)}')
+        roots &= wanted
+    result = [d for d in devices if any((SYS / root).resolve() in (d.resolve(), *d.resolve().parents) for root in roots)]
+    if not result:
+        raise RuntimeError('No PEX trees found')
+    return sorted(result, key=lambda d: (len(d.resolve().parts), d.name)), sorted(roots)
+
+
+def snapshot(devices):
+    result = {}
+    for d in devices:
+        resources = [[int(x, 16) for x in line.split()] for line in (d / 'resource').read_text().splitlines()]
+        with (d / 'config').open('rb', buffering=0) as f:
+            config = f.read(4096)
+        bridge = number(d / 'class') >> 8 == 0x0604
+        registers = {'command': config[4:6].hex(), 'windows' if bridge else 'bars': config[0x24:0x30].hex() if bridge else config[0x10:0x28].hex()}
+        pos, seen = 0x100, set()
+        while pos + 12 <= len(config) and pos not in seen:
+            seen.add(pos)
+            header = int.from_bytes(config[pos:pos + 4], 'little')
+            if header & 0xffff == 0x15:
+                count = (int.from_bytes(config[pos + 8:pos + 12], 'little') >> 5) & 7
+                registers['rebar'] = config[pos + 4:pos + 4 + 8 * count].hex()
+            pos = (header >> 20) & 0xfff
+            if pos < 0x100:
+                break
+        result[d.name] = {'resources': resources, 'registers': registers}
+    return result
+
+
+def validate_applied(devices, before, bar_gib):
+    after = snapshot(devices)
+    for d in devices:
+        old = before[d.name]['resources']
+        new = after[d.name]['resources']
+        for i, (a, b) in enumerate(zip(old, new)):
+            if i != 15 and not a[2] & 0x2000 and a != b:
+                raise RuntimeError(f'{d.name} non-prefetchable resource {i} changed')
+        if number(d / 'class') >> 16 != 3:
+            continue
+        bar = 1 if number(d / 'vendor') == 0x10de else 0
+        first, last, flags = new[bar]
+        size = last - first + 1
+        if size < bar_gib << 30 or first % size:
+            raise RuntimeError(f'{d.name}: invalid VRAM BAR size/alignment')
+        for parent in d.resolve().parents:
+            if not BDF.match(parent.name) or parent.name not in after:
+                continue
+            lo, hi, _ = after[parent.name]['resources'][15]
+            if not lo <= first <= last <= hi:
+                raise RuntimeError(f'{d.name}: BAR outside ancestor {parent.name}')
+        print(f'{d.name}: VRAM BAR {size >> 30} GiB at {first:#x}', flush=True)
+    return after
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['status', 'plan', 'apply', 'test-rollback'])
+    parser.add_argument('--module', type=Path, default=Path(__file__).resolve().parents[1] / 'pex_window.ko')
+    parser.add_argument('--roots', default='')
+    parser.add_argument('--bar-gib', type=int, default=32)
+    parser.add_argument('--slot-gib', type=int, default=64)
+    parser.add_argument('--empty-min-width', type=int, default=8)
+    parser.add_argument('--evidence', type=Path, default=Path('evidence'))
+    args = parser.parse_args()
+    if os.geteuid():
+        raise RuntimeError('Run as root')
+    with open('/run/pex-window.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        devices, roots = discover(args.roots)
+        if args.mode == 'status':
+            print(json.dumps(snapshot(devices), indent=2))
+            return
+        if Path('/sys/module/pex_window').exists():
+            raise RuntimeError('pex_window is already loaded; unload it before starting a new transaction')
+        module_args = [f'roots={",".join(roots)}', f'bar_gib={args.bar_gib}', f'slot_gib={args.slot_gib}', f'empty_min_width={args.empty_min_width}']
+        if args.mode == 'plan':
+            result = run('insmod', str(args.module), 'apply=0', *module_args, check=False)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip())
+            run('rmmod', 'pex_window')
+            print('Plan passed; inspect journalctl -k -g pex_window for addresses')
+            return
+        nodes = [p for pattern in ('/dev/kfd', '/dev/dri/*', '/dev/nvidia*') for p in glob.glob(pattern) if not os.path.isdir(p)]
+        if nodes:
+            busy = run('fuser', *nodes, check=False)
+            if busy.returncode != 1:
+                raise RuntimeError(f'GPU device users present or fuser failed: {busy.stdout} {busy.stderr}')
+        endpoints = [d for d in devices if number(d / 'class') >> 8 != 0x0604]
+        state = {d.name: {'power': (d / 'power/control').read_text().strip(),
+                         'driver': (d / 'driver').resolve().name if (d / 'driver').exists() else None,
+                         'override': (d / 'driver_override').read_text().strip()} for d in devices}
+        args.evidence.mkdir(parents=True, exist_ok=True)
+        dest = args.evidence / f'{time.time_ns()}-{args.mode}.json'
+        record = {'mode': args.mode, 'roots': roots, 'state': state}
+        dest.write_text(json.dumps(record, indent=2))
+        detached = []
+        guarded = []
+        baseline = None
+        safe = True
+        started = int(time.time())
+        try:
+            for d in devices:
+                (d / 'power/control').write_text('on')
+            for d in endpoints:
+                (d / 'driver_override').write_text('pex_window_hold')
+                guarded.append(d)
+            for d in reversed(endpoints):
+                if state[d.name]['driver']:
+                    print(f'Detaching {d.name} ({state[d.name]["driver"]})', flush=True)
+                    (d / 'driver/unbind').write_text(d.name)
+                    detached.append(d)
+            baseline = snapshot(devices)
+            record['before'] = baseline
+            dest.write_text(json.dumps(record, indent=2))
+            safe = False
+            inject = args.mode == 'test-rollback'
+            result = run('insmod', str(args.module), 'apply=1', f'fail_step={2 if inject else 0}', *module_args, check=False)
+            record['insmod'] = {'returncode': result.returncode, 'stderr': result.stderr}
+            record['kernel_log'] = run('journalctl', '-k', '--no-pager', '--since', f'@{started}').stdout
+            record['after'] = snapshot(devices)
+            if result.returncode:
+                safe = record['after'] == baseline
+                if not safe:
+                    raise RuntimeError('Baseline verification failed; endpoints left detached. Recovery state: ' + str(dest))
+                if not inject or 'baseline resource layout restored and verified' not in record['kernel_log']:
+                    raise RuntimeError('Module refused transaction: ' + result.stderr)
+                print('PASS: injected failure after programming; all resources and BAR/window/ReBAR registers restored exactly', flush=True)
+            elif inject:
+                raise RuntimeError('Fault injection unexpectedly succeeded')
+            else:
+                record['after'] = validate_applied(devices, baseline, args.bar_gib)
+                safe = True
+                print('PASS: allocations and ancestor containment verified', flush=True)
+        finally:
+            record['safe_to_rebind'] = safe
+            dest.write_text(json.dumps(record, indent=2))
+            errors = []
+            if safe:
+                for d in reversed(detached):
+                    driver = state[d.name]['driver']
+                    try:
+                        print(f'Rebinding {d.name} ({driver})', flush=True)
+                        (d / 'driver_override').write_text(driver)
+                        (Path('/sys/bus/pci/drivers') / driver / 'bind').write_text(d.name)
+                    except OSError as exc:
+                        errors.append(f'{d.name}: {exc}')
+                for d in guarded:
+                    override = state[d.name]['override']
+                    (d / 'driver_override').write_text('\n' if override in ('(null)', '') else override)
+                for d in reversed(devices):
+                    (d / 'power/control').write_text(state[d.name]['power'])
+            print(f'Evidence: {dest}', flush=True)
+            if errors:
+                raise RuntimeError('Rebind failures: ' + '; '.join(errors))
+            if not safe:
+                print('Endpoints remain detached with power on. See evidence before attempting recovery.', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)

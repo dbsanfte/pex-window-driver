@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+version=${1:?usage: scripts/package VERSION}
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+package_tmp=$(mktemp -d)
+trap 'rm -rf "$package_tmp"' EXIT
+prefix="pex-window-$version"
+mkdir -p "$package_tmp/$prefix" dist
+git archive HEAD | tar -x -C "$package_tmp/$prefix"
+printf '%s\n' "$version" > "$package_tmp/$prefix/VERSION"
+sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$version\"/" "$package_tmp/$prefix/dkms.conf"
+tar -cJf "dist/$prefix.tar.xz" -C "$package_tmp" "$prefix"
+(cd dist && sha256sum "$prefix.tar.xz" > "$prefix.tar.xz.sha256")

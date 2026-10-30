@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+(( EUID == 0 )) || { echo 'Run as root' >&2; exit 1; }
+version=$(cat VERSION)
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+kernel=${1:-$(uname -r)}
+[[ -d "/lib/modules/$kernel/build" && -f "/boot/initrd.img-$kernel" ]]
+for file in /etc/modprobe.d/pex-window.conf /etc/initramfs-tools/hooks/pex-window /etc/initramfs-tools/scripts/init-top/00-pex-window; do
+    [[ ! -e "$file" ]] || { echo "Already installed: $file (uninstall before replacing)" >&2; exit 1; }
+done
+mkdir -p /var/lib/pex-window/backups
+backup=$(mktemp -d "/var/lib/pex-window/backups/$kernel.XXXXXXXX")
+cp -a "/boot/initrd.img-$kernel" "$backup/initrd.img"
+printf '%s\n%s\n%s\n' "$version" "$kernel" "$backup" > /var/lib/pex-window/install-state
+recover() {
+    result=$?
+    if (( result )); then
+        rm -f /etc/modprobe.d/pex-window.conf /etc/initramfs-tools/hooks/pex-window /etc/initramfs-tools/scripts/init-top/00-pex-window
+        cp -a "$backup/initrd.img" "/boot/initrd.img-$kernel"
+        echo "Installation failed; original initramfs restored from $backup" >&2
+    fi
+}
+trap recover EXIT
+source_dir="/usr/src/pex-window-$version"
+[[ ! -e "$source_dir" ]] || { echo "$source_dir already exists" >&2; exit 1; }
+install -d "$source_dir"
+install -m 0644 pex_window.c plan.h Makefile VERSION dkms.conf "$source_dir/"
+dkms add -m pex-window -v "$version"
+dkms build -m pex-window -v "$version" -k "$kernel"
+dkms install -m pex-window -v "$version" -k "$kernel"
+install -m 0644 initramfs/pex-window.conf /etc/modprobe.d/pex-window.conf
+install -m 0755 initramfs/hook /etc/initramfs-tools/hooks/pex-window
+install -m 0755 initramfs/00-pex-window /etc/initramfs-tools/scripts/init-top/00-pex-window
+depmod -a "$kernel"
+update-initramfs -u -k "$kernel"
+lsinitramfs "/boot/initrd.img-$kernel" > "$backup/installed-contents.txt"
+grep -q 'scripts/init-top/00-pex-window' "$backup/installed-contents.txt"
+grep -q 'pex_window.ko' "$backup/installed-contents.txt"
+trap - EXIT
+printf 'Installed pex-window %s for %s. Original initramfs: %s/initrd.img\n' "$version" "$kernel" "$backup"
+echo 'Live PCI state was not changed by this installer. Boot ordering is validated on the next boot.'
