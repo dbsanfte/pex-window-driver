@@ -19,6 +19,7 @@ struct model {
     unsigned int ignore_disable_after; /**< Ignore disables from this invocation onward. */
     bool ignore_write;                 /**< Successful writes may deliberately do nothing. */
     bool drained;                      /**< Transactions have drained after mastering disable. */
+    bool partial_failure;              /**< A failing operation has already changed some objects. */
     int resources;                     /**< Zero: original; one: new; minus one: released. */
     int hardware;                      /**< Zero: original; one: new. */
     bool old_occupied;                 /**< Another allocation now occupies the old range. */
@@ -108,6 +109,8 @@ static int register_layout(void *opaque, bool original)
     int ret = event(m, original ? 'O' : 'N');
     if (!ret)
         m->resources = original ? 0 : 1;
+    else if (m->partial_failure)
+        m->resources = 2;
     return ret;
 }
 /** @brief Model verified hardware programming with matching resources.
@@ -121,6 +124,8 @@ static int program(void *opaque, bool original)
     int ret = event(m, original ? 'R' : 'P');
     if (!ret)
         m->hardware = original ? 0 : 1;
+    else if (m->partial_failure)
+        m->hardware = 2;
     return ret;
 }
 /** @brief Verify enabled state when refreshing PCI power-management state.
@@ -173,6 +178,15 @@ static void apply_failures(void)
         assert(pw_apply(&operations, &m, 0, &result) == -EIO);
         assert(result.restored && !result.recovery_error);
         assert(m.command == 6 && m.resources == 0 && m.hardware == 0);
+    }
+    /* Registration/programming may fail after earlier resources already changed. */
+    const char partial_events[] = "NP";
+    for (unsigned int i = 0; i < sizeof(partial_events) - 1; i++) {
+        struct model m = {
+            .command = 6, .fail = partial_events[i], .occurrence = 1, .partial_failure = true};
+        struct pw_outcome result;
+        assert(pw_apply(&operations, &m, 0, &result) == -EIO);
+        assert(result.restored && m.command == 6 && m.resources == 0 && m.hardware == 0);
     }
     for (unsigned int step = 1; step <= 2; step++) {
         struct model m = {.command = 6};
