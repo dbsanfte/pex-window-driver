@@ -1,8 +1,10 @@
 # pex-window
 
-**Give GPUs behind Broadcom/PLX PEX switches enough PCIe address space for large VRAM BARs.** `pex-window` is an out-of-tree Linux kernel module that plans the complete prefetchable-memory hierarchy, enlarges the bridge windows, and resizes supported GPU BARs before the GPU drivers probe.
+**Give GPUs behind Broadcom/PLX PEX switches enough PCIe address space for large VRAM BARs.**
 
-It updates Linux's resource bookkeeping and the hardware registers together. The default policy reserves **64 GiB per GPU slot** for a **32 GiB VRAM BAR** plus auxiliary BARs and alignment. It discovers the actual topology and has no fixed switch-count or five-GPU limit.
+`pex-window` is an out-of-tree Linux kernel module that plans the complete prefetchable-memory hierarchy, enlarges the bridge windows, and resizes supported GPU BARs before the GPU drivers probe.
+
+It updates Linux's resource bookkeeping and the hardware registers together. The default policy reserves **64 GiB per GPU slot** for a **32 GiB VRAM BAR** plus auxiliary BARs and alignment. It discovers the actual topology and has no fixed switch-count or GPU limit.
 
 On the development host, this enabled 32 GiB BARs on an RX 7900 XTX and two RTX 3090s while preserving the four MI50s' existing 32 GiB BAR sizes. All seven GPUs passed compute/copy tests. See [hardware validation](docs/validation.md) for the tested configuration and limits.
 
